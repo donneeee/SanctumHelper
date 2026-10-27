@@ -10,6 +10,31 @@ namespace SanctumHelper;
 
 /// <summary>What the overlay should draw right now.</summary>
 /// <summary>The latest facing and camera directions, for the overlay to animate between frames
+
+/// <summary>One-euro filter for an angle in degrees (Casiez et al.): smooths a lot while the value holds still and
+/// less the faster it moves, so a resting cone stops jittering and a turning one doesn't trail behind.</summary>
+public sealed class AngleFilter
+{
+    // 1.2 Hz when still; + 0.02 Hz per deg/s of turning (a 180 deg/s spin: ~4.8 Hz, about 30 ms of lag)
+    const double MinCutoff = 1.2, Beta = 0.02, SpeedCutoff = 1.0;
+    double value, speed;
+    DateTime last;
+
+    public double Reset(double angle, DateTime now) { value = angle; speed = 0; last = now; return value; }
+
+    public double Next(double angle, DateTime now)
+    {
+        double dt = Math.Clamp((now - last).TotalSeconds, 1e-3, 0.5);
+        last = now;
+        double d = ((angle - value) % 360 + 540) % 360 - 180;     // the short way round
+        speed += Alpha(SpeedCutoff, dt) * (d / dt - speed);
+        value = ((value + Alpha(MinCutoff + Beta * Math.Abs(speed), dt) * d) % 360 + 360) % 360;
+        return value;
+    }
+
+    static double Alpha(double cutoff, double dt) => 1 / (1 + 1 / (2 * Math.PI * cutoff * dt));
+}
+
 /// (written by the engine's heading loop, read on the UI thread).</summary>
 public static class HeadingFeed
 {
@@ -209,6 +234,7 @@ public sealed class Engine : IDisposable
         settings.RunId = gameLog.RunId;
         try { settings.Save(); } catch (Exception e) { Log.Write("save run layout: " + e.Message); }
         Log.Write($"layout locked: {l.Number} via {source}");
+        arts.Trim(n => n == l.Number);
         Notify?.Invoke(Lang.F("Sanctum found #{0}", l.Number), null);
         StatusChanged?.Invoke();
     }
@@ -229,6 +255,7 @@ public sealed class Engine : IDisposable
                     CurrentLayout = null; lastPose = null; player = null; minimap.Reset();
                     onIsland = false; islandPlayer = null; islandPose = null; islandTracker.Reset();
                     ClearGuesses();
+                    arts.Trim(_ => false);
                     settings.RunLayout = 0;
                     try { settings.Save(); } catch { /* not critical */ }
                     StatusChanged?.Invoke();
@@ -418,12 +445,8 @@ public sealed class Engine : IDisposable
         // a 0.3 cut-off dropped ~40% of them and the cone froze, then leapt (31 big swings -> 2).
         if (HeadingDetector.FromViewCone(mm, ui, out double coneConf) is double ch && coneConf >= 0.2)
         {
-            if (camera is double cp && (now - cameraTime).TotalSeconds < 1)
-            {
-                double d = ((ch - cp) % 360 + 540) % 360 - 180;
-                camera = (cp + 0.5 * d + 360) % 360;
-            }
-            else camera = ch;
+            // Adaptive smoothing (one-euro filter): steady while the camera holds still, no lag while it turns.
+            camera = (now - cameraTime).TotalSeconds < 1 ? cameraFilter.Next(ch, now) : cameraFilter.Reset(ch, now);
             cameraTime = now;
             // A blink of the arrow (particles) keeps the last heading; only a lasting absence means
             // egg form. (Camera and character can face different ways: switching would jump.)
@@ -458,6 +481,7 @@ public sealed class Engine : IDisposable
     }
 
     DateTime arrowRetry, lastArrowSeen, cameraTime;
+    readonly AngleFilter cameraFilter = new();
     int eggVotes;
     bool eggForm;
     DateTime lastEggSeen;
@@ -977,7 +1001,9 @@ public sealed class Engine : IDisposable
                     max = Math.Max(max, redMax);
                 }
                 lastTimerScore = max;
-                seen = max >= 0.7;
+                // seen at 0.7, lost below 0.55: scores hover near 0.7 over bright floor, which flipped it
+                // back and forth (151 times in one evening's log)
+                seen = max >= (lastTimerSeen ? 0.55 : 0.7);
             }
         }
         if (seen != lastTimerSeen)

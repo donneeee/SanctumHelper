@@ -86,6 +86,18 @@ public sealed class MapArtCache(LayoutDb db)
     readonly ConcurrentDictionary<(int, int), MapArt> art = new();
     public MapArt Get(Layout l, int floor = 0) => art.GetOrAdd((l.Number, floor),
         _ => new MapArt(db.FloorPath(l, floor), l.ImageSize[0], l.ImageSize[1]));
+
+    /// <summary>Lets go of the map art of every layout but the ones kept (all of them when none is): a run's
+    /// candidates used to stay loaded for good, ~400 MB after a run. Freed 30 s later, so a frame still being
+    /// matched against one isn't cut off; a layout needed again is simply loaded again.</summary>
+    public void Trim(Func<int, bool> keep)
+    {
+        var dropped = new List<MapArt>();
+        foreach (var key in art.Keys)
+            if (!keep(key.Item1) && art.TryRemove(key, out var a)) dropped.Add(a);
+        if (dropped.Count == 0) return;
+        System.Threading.Tasks.Task.Delay(30_000).ContinueWith(_ => { foreach (var a in dropped) a.Dispose(); });
+    }
 }
 
 /// <summary>ORB features of each layout's map art, at two sizes so both a zoomed-in
@@ -1154,6 +1166,77 @@ public sealed class HeadingDetector
     /// the arrow can't be read (twined with an egg: the egg marker replaces it). Degrees
     /// clockwise from north, or null; confidence is how much the cone stands out (0-1).</summary>
     public static double? FromViewCone(Mat minimapBgr, double uiScale, out double confidence)
+    {
+        // The cone's two edges, read at full 1080p resolution in 1-degree steps: the middle between them is where the
+        // camera looks. Bright floor or walls under the cone shift its brightest part (what the centroid reader below
+        // follows, so the cone drifted) but not where it starts and ends. Falls back to the centroid reader when the
+        // edges don't look like a cone.
+        confidence = 0;
+        using var small = new Mat();
+        double k = 210.0 / Math.Min(minimapBgr.Width, minimapBgr.Height);
+        Cv2.Resize(minimapBgr, small, new Size(), k, k, InterpolationFlags.Area);
+        using var hsv = new Mat();
+        Cv2.CvtColor(small, hsv, ColorConversionCodes.BGR2HSV);
+        const int Bins = 360;
+        var sum = new double[Bins];
+        var n = new int[Bins];
+        var lut = ConeLut(small.Width, small.Height, Bins);
+        hsv.GetArray(out Vec3b[] px);
+        for (int i = 0; i < px.Length; i++)
+        {
+            int b = lut[i];
+            if (b < 0) continue;
+            var v = px[i];
+            if (v.Item1 < 50 && v.Item2 > 205) sum[b] += Math.Min(1, (v.Item2 - 205) / 35.0);
+            n[b]++;
+        }
+        var raw = new double[Bins];
+        for (int i = 0; i < Bins; i++) raw[i] = n[i] > 0 ? sum[i] / n[i] : 0;
+        var prof = new double[Bins];                 // lightly smoothed (5 deg), so single pixels don't make edges
+        for (int i = 0; i < Bins; i++)
+        {
+            double t = 0;
+            for (int j = -2; j <= 2; j++) t += raw[((i + j) % Bins + Bins) % Bins];
+            prof[i] = t / 5;
+        }
+        // where the cone is: the best 72-degree arc (as the centroid reader), and how much it stands out
+        const int Win = 72;
+        int best = 0; double bestSum = -1;
+        for (int i = 0; i < Bins; i++)
+        {
+            double t = 0;
+            for (int j = 0; j < Win; j++) t += prof[(i + j) % Bins];
+            if (t > bestSum) { bestSum = t; best = i; }
+        }
+        double inside = bestSum / Win;
+        var rest = Enumerable.Range(0, Bins).Where(i => ((i - best) % Bins + Bins) % Bins >= Win).Select(i => prof[i]).OrderBy(v => v).ToList();
+        double outside = rest[rest.Count / 2];
+        confidence = Math.Clamp(inside - outside, 0, 1);
+        if (inside < 0.25 || inside < outside * 2 + 0.1) return null;
+        // the edges: from the arc's middle, outwards until the profile falls below half-way between the cone's
+        // plateau and the floor around it (with sub-degree interpolation)
+        var arc = Enumerable.Range(0, Win).Select(j => prof[(best + j) % Bins]).OrderBy(v => v).ToList();
+        double plateau = arc[(int)(arc.Count * 0.75)];
+        double level = outside + 0.5 * (plateau - outside);
+        int mid = (best + Win / 2) % Bins;
+        double? Edge(int step)
+        {
+            for (int d = 0; d < 100; d++)
+            {
+                int a = ((mid + step * d) % Bins + Bins) % Bins, b = ((mid + step * (d + 1)) % Bins + Bins) % Bins;
+                if (prof[a] >= level && prof[b] < level)
+                    return mid + step * (d + (prof[a] - level) / Math.Max(1e-9, prof[a] - prof[b]));
+            }
+            return null;
+        }
+        if (Edge(-1) is double left && Edge(1) is double right && right - left is >= 35 and <= 140)
+            return (((left + right) / 2 + 0.5) % 360 + 360) % 360;      // + 0.5: bin i covers i..i+1 degrees
+        return FromViewConeCentroid(minimapBgr, uiScale, out confidence);
+    }
+
+    /// <summary>The previous reader: the brightness-weighted centre of the brightest 72-degree arc, at half
+    /// resolution. Kept as the fallback, and for comparing the two (--cone-replay writes both).</summary>
+    public static double? FromViewConeCentroid(Mat minimapBgr, double uiScale, out double confidence)
     {
         confidence = 0;
         using var small = new Mat();
