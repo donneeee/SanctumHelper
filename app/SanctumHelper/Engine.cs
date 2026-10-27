@@ -234,7 +234,7 @@ public sealed class Engine : IDisposable
         settings.RunId = gameLog.RunId;
         try { settings.Save(); } catch (Exception e) { Log.Write("save run layout: " + e.Message); }
         Log.Write($"layout locked: {l.Number} via {source}");
-        arts.Trim(n => n == l.Number);
+        arts.Trim(n => n == l.Number); refiner.Trim(n => n == l.Number); minimap.Release(n => n == l.Number);
         Notify?.Invoke(Lang.F("Sanctum found #{0}", l.Number), null);
         StatusChanged?.Invoke();
     }
@@ -255,7 +255,7 @@ public sealed class Engine : IDisposable
                     CurrentLayout = null; lastPose = null; player = null; minimap.Reset();
                     onIsland = false; islandPlayer = null; islandPose = null; islandTracker.Reset();
                     ClearGuesses();
-                    arts.Trim(_ => false);
+                    arts.Trim(_ => false); refiner.Trim(_ => false); minimap.Release();
                     settings.RunLayout = 0;
                     try { settings.Save(); } catch { /* not critical */ }
                     StatusChanged?.Invoke();
@@ -1076,6 +1076,7 @@ public sealed class Engine : IDisposable
     void ClearGuesses()
     {
         bool had = guesses.Count > 0;
+        foreach (var g in guesses.Values) g.t.Release();   // each candidate's tracker holds its own scaled floors
         guesses.Clear();
         guessTask = null;
         if (had) StatusChanged?.Invoke();
@@ -1089,7 +1090,7 @@ public sealed class Engine : IDisposable
             var (won, prune) = guessTask.IsCompletedSuccessfully ? guessTask.Result : (0, []);
             if (!guessTask.IsCompletedSuccessfully) Log.Write("guess: " + guessTask.Exception?.InnerException?.Message);
             guessTask = null;
-            foreach (var n in prune) guesses.Remove(n);
+            foreach (var n in prune) if (guesses.Remove(n, out var gone)) gone.t.Release();
             if (won != 0 && CurrentLayout == null && db.ByNumber(won) is Layout winner)
             {
                 var spot = guesses.TryGetValue(won, out var wg) ? wg.t.LastPosition : null;
@@ -1098,7 +1099,7 @@ public sealed class Engine : IDisposable
                 // Hand over to the main tracker from where the guess has the player now.
                 minimap.Reset();
                 minimap.Seed(spot ?? new Point2d(winner.Orange.Img[0], winner.Orange.Img[1]));
-                guesses.Clear();
+                ClearGuesses();
                 return;
             }
         }
@@ -1146,7 +1147,7 @@ public sealed class Engine : IDisposable
         if (guessWidened) cands = db.Candidates(null);
         var live = guesses.Where(kv => cands.Any(c => c.Number == kv.Key))
             .Select(kv => (n: kv.Key, layout: db.ByNumber(kv.Key)!, t: kv.Value.t, scores: kv.Value.scores)).ToList();
-        if (live.Count == 0) { guesses.Clear(); return; } // difficulty changed: start over next round
+        if (live.Count == 0) { ClearGuesses(); return; } // difficulty changed: start over next round
         // Nobody fits after 20 s: measured, the right layout averages 0.55+ within a few rounds
         // from the orange door; lost trackers sit around 0.3-0.4 on look-alike corridors.
         bool restart = !wholeSearch && clock.ElapsedMilliseconds - guessStarted > 20000

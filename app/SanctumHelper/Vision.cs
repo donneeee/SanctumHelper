@@ -90,13 +90,27 @@ public sealed class MapArtCache(LayoutDb db)
     /// <summary>Lets go of the map art of every layout but the ones kept (all of them when none is): a run's
     /// candidates used to stay loaded for good, ~400 MB after a run. Freed 30 s later, so a frame still being
     /// matched against one isn't cut off; a layout needed again is simply loaded again.</summary>
-    public void Trim(Func<int, bool> keep)
+    public void Trim(Func<int, bool> keep) => Later.Dispose(Later.Take(art, k => keep(k.Item1)));
+}
+
+/// <summary>Freeing per-layout images. They're OpenCV memory the .NET garbage collector doesn't see, so a cache
+/// that is only dropped (not disposed) can sit at hundreds of MB until the process ends.</summary>
+static class Later
+{
+    /// <summary>Removes and returns the entries not kept.</summary>
+    public static List<V> Take<K, V>(ConcurrentDictionary<K, V> d, Func<K, bool> keep) where K : notnull
     {
-        var dropped = new List<MapArt>();
-        foreach (var key in art.Keys)
-            if (!keep(key.Item1) && art.TryRemove(key, out var a)) dropped.Add(a);
-        if (dropped.Count == 0) return;
-        System.Threading.Tasks.Task.Delay(30_000).ContinueWith(_ => { foreach (var a in dropped) a.Dispose(); });
+        var taken = new List<V>();
+        foreach (var k in d.Keys)
+            if (!keep(k) && d.TryRemove(k, out var v)) taken.Add(v);
+        return taken;
+    }
+
+    /// <summary>Disposes 30 s later, so a frame still being matched against one isn't cut off.</summary>
+    public static void Dispose<T>(List<T> items) where T : IDisposable
+    {
+        if (items.Count == 0) return;
+        System.Threading.Tasks.Task.Delay(30_000).ContinueWith(_ => { foreach (var d in items) d.Dispose(); });
     }
 }
 
@@ -248,6 +262,9 @@ public sealed class MinimapTracker(MapArtCache arts)
     public Point2d? LastPosition => last;
 
     public void Reset() { scale = null; last = null; LastScore = 0; vel = default; Floor = 0; }
+
+    /// <summary>Lets go of the cached floors of every layout but the ones kept (all of them when none is).</summary>
+    public void Release(Func<int, bool>? keep = null) => Later.Dispose(Later.Take(artFloor, k => keep?.Invoke(k.Item1) ?? false));
 
     // Motion filter (constant velocity, alpha-beta): follows without the lag of plain smoothing,
     // carries through a missed fix, and refuses implausible jumps. Units: map-art px and px/s.
@@ -720,6 +737,9 @@ public sealed class FloorRefiner(MapArtCache arts)
     readonly ConcurrentDictionary<(int, int), Mat> artFloor = new();
     public string LastInfo { get; private set; } = "";
     public double LastScore { get; private set; }
+
+    /// <summary>Lets go of the full-size floors of every layout but the ones kept (all of them when none is).</summary>
+    public void Trim(Func<int, bool> keep) => Later.Dispose(Later.Take(artFloor, k => keep(k.Item1)));
     /// <summary>Floor the full map is showing: 0 ground, 1+ upstairs.</summary>
     public int Floor { get; private set; }
 
